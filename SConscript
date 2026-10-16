@@ -16,7 +16,6 @@ mesa_env.Append(CPPPATH=[
     '#components/cherry_mesa/include/EGL',
     '#components/cherry_mesa/include/GLES2',
     '#components/cherry_mesa/include/GL',
-    '#components/cherry_drm/include',
     '#components/cherry_kal/include',
     '#components/cherry_vfs/include',
     '#components/cherry_shell/include',

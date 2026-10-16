@@ -1,22 +1,21 @@
 /*
  * CherryMesa - Generic Buffer Management (GBM) Library
  *
- * Implements GBM Device, Surface & Buffer Objects over CherryDRM
+ * Implements GBM Device, Surface & Buffer Objects over standard DRM POSIX UAPI
  * Copyright (c) 2026 ForgeStitch
  * SPDX-License-Identifier: MIT
  */
 
 #include "gbm.h"
 #include "cherry_kal.h"
+#include "vfs_posix.h"
 #include "drm/drm.h"
 #include "drm/drm_mode.h"
 #include "drm/panfrost_drm.h"
-#include "cherry_drm.h"
 #include <string.h>
 
 struct gbm_device {
     int                 drm_fd;
-    struct drm_device  *drm_dev;
     bool                is_render;
 };
 
@@ -27,6 +26,7 @@ struct gbm_bo {
     uint32_t            stride;
     uint32_t            format;
     uint32_t            handle;
+    uint64_t            offset;
     size_t              size;
     void               *vaddr;
     int                 prime_fd;
@@ -47,12 +47,28 @@ struct gbm_device *gbm_create_device(int fd)
     struct gbm_device *gbm = (struct gbm_device *)kzalloc(sizeof(*gbm), GFP_KERNEL);
     if (!gbm) return NULL;
 
+    if (fd <= 0) {
+        fd = open("/dev/dri/card0", O_RDWR);
+        if (fd < 0) fd = open("/dev/card0", O_RDWR);
+        if (fd < 0) {
+            fd = open("/dev/dri/renderD128", O_RDWR);
+            if (fd < 0) fd = open("/dev/renderD128", O_RDWR);
+            gbm->is_render = true;
+        }
+    }
     gbm->drm_fd = fd;
-    /* Determine if fd refers to primary or render node */
-    gbm->drm_dev = cherry_drm_get_primary();
-    if (!gbm->drm_dev) {
-        gbm->drm_dev = cherry_drm_get_render();
-        gbm->is_render = true;
+
+    if (gbm->drm_fd >= 0) {
+        char name[32] = {0};
+        struct drm_version v;
+        memset(&v, 0, sizeof(v));
+        v.name = name;
+        v.name_len = sizeof(name);
+        if (ioctl(gbm->drm_fd, DRM_IOCTL_VERSION, &v) == 0) {
+            if (strstr(name, "panfrost")) {
+                gbm->is_render = true;
+            }
+        }
     }
 
     return gbm;
@@ -61,6 +77,10 @@ struct gbm_device *gbm_create_device(int fd)
 void gbm_device_destroy(struct gbm_device *gbm)
 {
     if (!gbm) return;
+    if (gbm->drm_fd >= 0) {
+        close(gbm->drm_fd);
+        gbm->drm_fd = -1;
+    }
     kfree(gbm);
 }
 
@@ -74,7 +94,7 @@ struct gbm_bo *gbm_bo_create(struct gbm_device *gbm,
                              uint32_t format, uint32_t flags)
 {
     (void)flags;
-    if (!gbm || !gbm->drm_dev || width == 0 || height == 0) return NULL;
+    if (!gbm || gbm->drm_fd < 0 || width == 0 || height == 0) return NULL;
 
     struct gbm_bo *bo = (struct gbm_bo *)kzalloc(sizeof(*bo), GFP_KERNEL);
     if (!bo) return NULL;
@@ -85,21 +105,23 @@ struct gbm_bo *gbm_bo_create(struct gbm_device *gbm,
     bo->format = format;
     bo->prime_fd = -1;
 
-    /* Allocate buffer through CherryDRM IOCTL */
+    /* Allocate buffer through standard DRM IOCTL */
     if (gbm->is_render) {
         /* Allocate on Mali Panfrost GPU */
         struct drm_panfrost_create_bo c_bo;
         memset(&c_bo, 0, sizeof(c_bo));
         c_bo.size = width * height * 4;
         c_bo.flags = 0;
-        if (cherry_drm_ioctl(gbm->drm_dev, DRM_IOCTL_PANFROST_CREATE_BO, &c_bo) == 0) {
+        if (ioctl(gbm->drm_fd, DRM_IOCTL_PANFROST_CREATE_BO, &c_bo) == 0) {
             bo->handle = c_bo.handle;
+            bo->offset = c_bo.offset;
             bo->size = c_bo.size;
             bo->stride = width * 4;
 
             struct drm_panfrost_mmap_bo m_bo;
+            memset(&m_bo, 0, sizeof(m_bo));
             m_bo.handle = bo->handle;
-            if (cherry_drm_ioctl(gbm->drm_dev, DRM_IOCTL_PANFROST_MMAP_BO, &m_bo) == 0) {
+            if (ioctl(gbm->drm_fd, DRM_IOCTL_PANFROST_MMAP_BO, &m_bo) == 0) {
                 bo->vaddr = (void *)(uintptr_t)m_bo.offset;
             }
         }
@@ -111,14 +133,15 @@ struct gbm_bo *gbm_bo_create(struct gbm_device *gbm,
         c_dumb.height = height;
         c_dumb.bpp = 32;
 
-        if (cherry_drm_ioctl(gbm->drm_dev, DRM_IOCTL_MODE_CREATE_DUMB, &c_dumb) == 0) {
+        if (ioctl(gbm->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &c_dumb) == 0) {
             bo->handle = c_dumb.handle;
             bo->size = c_dumb.size;
             bo->stride = c_dumb.pitch;
 
             struct drm_mode_map_dumb m_dumb;
+            memset(&m_dumb, 0, sizeof(m_dumb));
             m_dumb.handle = bo->handle;
-            if (cherry_drm_ioctl(gbm->drm_dev, DRM_IOCTL_MODE_MAP_DUMB, &m_dumb) == 0) {
+            if (ioctl(gbm->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &m_dumb) == 0) {
                 bo->vaddr = (void *)(uintptr_t)m_dumb.offset;
             }
         }
@@ -134,12 +157,12 @@ struct gbm_bo *gbm_bo_create(struct gbm_device *gbm,
 
 void gbm_bo_destroy(struct gbm_bo *bo)
 {
-    if (!bo || !bo->device || !bo->device->drm_dev) return;
+    if (!bo || !bo->device || bo->device->drm_fd < 0) return;
 
     struct drm_gem_close gc;
+    memset(&gc, 0, sizeof(gc));
     gc.handle = bo->handle;
-    gc.pad = 0;
-    cherry_drm_ioctl(bo->device->drm_dev, DRM_IOCTL_GEM_CLOSE, &gc);
+    ioctl(bo->device->drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
 
     kfree(bo);
 }
@@ -178,14 +201,14 @@ union gbm_bo_handle gbm_bo_get_handle(struct gbm_bo *bo)
 
 int gbm_bo_get_fd(struct gbm_bo *bo)
 {
-    if (!bo || !bo->device || !bo->device->drm_dev) return -1;
+    if (!bo || !bo->device || bo->device->drm_fd < 0) return -1;
     if (bo->prime_fd > 0) return bo->prime_fd;
 
     struct drm_prime_handle prime;
     memset(&prime, 0, sizeof(prime));
     prime.handle = bo->handle;
     prime.flags = DRM_CLOEXEC | DRM_RDWR;
-    if (cherry_drm_ioctl(bo->device->drm_dev, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) == 0) {
+    if (ioctl(bo->device->drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) == 0) {
         bo->prime_fd = prime.fd;
         return bo->prime_fd;
     }
@@ -227,7 +250,7 @@ struct gbm_surface *gbm_surface_create(struct gbm_device *gbm,
     surf->flags = flags;
     surf->front_idx = 0;
 
-    /* Allocate Front and Back buffers */
+    /* Allocate double buffers (front and back) */
     surf->buffers[0] = gbm_bo_create(gbm, width, height, format, flags);
     surf->buffers[1] = gbm_bo_create(gbm, width, height, format, flags);
 
@@ -241,12 +264,12 @@ struct gbm_surface *gbm_surface_create(struct gbm_device *gbm,
     return surf;
 }
 
-void gbm_surface_destroy(struct gbm_surface *surf)
+void gbm_surface_destroy(struct gbm_surface *surface)
 {
-    if (!surf) return;
-    if (surf->buffers[0]) gbm_bo_destroy(surf->buffers[0]);
-    if (surf->buffers[1]) gbm_bo_destroy(surf->buffers[1]);
-    kfree(surf);
+    if (!surface) return;
+    if (surface->buffers[0]) gbm_bo_destroy(surface->buffers[0]);
+    if (surface->buffers[1]) gbm_bo_destroy(surface->buffers[1]);
+    kfree(surface);
 }
 
 uint32_t gbm_surface_get_width(struct gbm_surface *surf)
@@ -259,20 +282,21 @@ uint32_t gbm_surface_get_height(struct gbm_surface *surf)
     return surf ? surf->height : 0;
 }
 
-struct gbm_bo *gbm_surface_lock_front_buffer(struct gbm_surface *surf)
+struct gbm_bo *gbm_surface_lock_front_buffer(struct gbm_surface *surface)
 {
-    if (!surf) return NULL;
-    struct gbm_bo *bo = surf->buffers[surf->front_idx];
-    surf->front_idx = 1 - surf->front_idx; /* Swap buffers */
+    if (!surface) return NULL;
+    struct gbm_bo *bo = surface->buffers[surface->front_idx];
+    surface->front_idx = 1 - surface->front_idx;
     return bo;
 }
 
-void gbm_surface_release_buffer(struct gbm_surface *surf, struct gbm_bo *bo)
+void gbm_surface_release_buffer(struct gbm_surface *surface, struct gbm_bo *bo)
 {
-    (void)surf; (void)bo;
+    (void)surface;
+    (void)bo;
 }
 
-int gbm_surface_has_free_buffers(struct gbm_surface *surf)
+int gbm_surface_has_free_buffers(struct gbm_surface *surface)
 {
-    return surf ? 1 : 0;
+    return surface ? 1 : 0;
 }

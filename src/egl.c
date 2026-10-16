@@ -8,8 +8,10 @@
 
 #include "EGL/egl.h"
 #include "cherry_mesa.h"
-#include "cherry_drm.h"
 #include "cherry_kal.h"
+#include "vfs_posix.h"
+#include "drm/drm.h"
+#include "drm/drm_mode.h"
 #include <string.h>
 
 struct egl_display_impl {
@@ -327,23 +329,28 @@ EGLAPI EGLBoolean EGLAPIENTRY eglSwapBuffers(EGLDisplay dpy, EGLSurface surface)
         s_current_context->pipe->flush(s_current_context->pipe);
     }
 
-    /* 2. Copy back buffer pixels to display scanout / front buffer */
-    struct drm_device *card = cherry_drm_get_primary();
-    if (card && card->crtc.fb && card->crtc.fb->objs[0] && s->color_buffers[s->current_buf]) {
-        void *fb_vaddr = card->crtc.fb->objs[0]->vaddr;
-        void *src_vaddr = s->color_buffers[s->current_buf]->vaddr;
-        if (fb_vaddr && src_vaddr) {
-            size_t max_fb = card->crtc.fb->objs[0]->size;
-            size_t sz = (size_t)s->width * s->height * 4;
-            if (sz > max_fb) sz = max_fb;
-            memcpy(fb_vaddr, src_vaddr, sz);
+    /* 2. Copy back buffer pixels to display scanout via /dev/fb0 */
+    int fb_fd = open("/dev/fb0", O_RDWR);
+    if (fb_fd >= 0) {
+        if (s->color_buffers[s->current_buf]) {
+            void *src_vaddr = s->color_buffers[s->current_buf]->vaddr;
+            if (src_vaddr) {
+                size_t sz = (size_t)s->width * s->height * 4;
+                write(fb_fd, src_vaddr, sz);
+            }
         }
+        close(fb_fd);
+    }
 
-        /* 3. Notify DRM of dirty region / page flip */
+    /* 3. Notify DRM of dirty region / page flip */
+    int drm_fd = open("/dev/dri/card0", O_RDWR);
+    if (drm_fd < 0) drm_fd = open("/dev/card0", O_RDWR);
+    if (drm_fd >= 0) {
         struct drm_mode_fb_dirty_cmd dirty;
         memset(&dirty, 0, sizeof(dirty));
-        dirty.fb_id = card->crtc.fb_id;
-        cherry_drm_ioctl(card, DRM_IOCTL_MODE_DIRTYFB, &dirty);
+        dirty.fb_id = 1;
+        ioctl(drm_fd, DRM_IOCTL_MODE_DIRTYFB, &dirty);
+        close(drm_fd);
     }
 
     /* 4. Swap buffer index */

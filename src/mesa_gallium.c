@@ -7,8 +7,10 @@
  */
 
 #include "cherry_mesa.h"
-#include "cherry_drm.h"
 #include "cherry_kal.h"
+#include "vfs_posix.h"
+#include "drm/drm.h"
+#include "drm/drm_mode.h"
 #include "drm/panfrost_drm.h"
 #include "drm/virtgpu_drm.h"
 #include <string.h>
@@ -167,13 +169,15 @@ static void bifrost_rasterize_triangles(struct pipe_context *ctx, const float *v
     uint32_t tiles_y = (h + BIFROST_TILE_SIZE - 1) / BIFROST_TILE_SIZE;
 
     /* 1. Bifrost Tiler Stage: Emit Hardware Job Chain (Tiler + Fragment) */
-    struct drm_device *mali_dev = cherry_drm_get_render();
-    if (mali_dev) {
+    int render_fd = open("/dev/dri/renderD128", O_RDWR);
+    if (render_fd < 0) render_fd = open("/dev/card1", O_RDWR);
+    if (render_fd >= 0) {
         struct drm_panfrost_submit submit;
         memset(&submit, 0, sizeof(submit));
         submit.jc = 0x50001000; /* Simulated Bifrost Job Chain */
         submit.requirements = PANFROST_JD_REQ_FS;
-        cherry_drm_ioctl(mali_dev, DRM_IOCTL_PANFROST_SUBMIT, &submit);
+        ioctl(render_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
+        close(render_fd);
     }
 
     /* 2. Process triangles through Bifrost 16x16 Tile Engine */
@@ -274,12 +278,14 @@ static void gallium_draw_triangles(struct pipe_context *ctx, const float *vertic
         bifrost_rasterize_triangles(ctx, vertices, count);
         return;
     } else if (ctx->screen && ctx->screen->driver_type == GALLIUM_DRIVER_VIRGL) {
-        struct drm_device *card = cherry_drm_get_primary();
-        if (card) {
+        int card_fd = open("/dev/dri/card0", O_RDWR);
+        if (card_fd < 0) card_fd = open("/dev/card0", O_RDWR);
+        if (card_fd >= 0) {
             struct drm_virtgpu_execbuffer eb;
             memset(&eb, 0, sizeof(eb));
             eb.size = count * 6 * sizeof(float);
-            cherry_drm_ioctl(card, DRM_IOCTL_VIRTGPU_EXECBUFFER, &eb);
+            ioctl(card_fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &eb);
+            close(card_fd);
         }
     }
 
@@ -318,17 +324,38 @@ struct pipe_screen *pipe_screen_create(int drm_fd)
     screen->resource_create = gallium_resource_create;
     screen->resource_destroy = gallium_resource_destroy;
 
-    /* Check if Panfrost Mali GPU or VirtIO-GPU is present */
-    struct drm_device *render = cherry_drm_get_render();
-    struct drm_device *primary = cherry_drm_get_primary();
+    /* Check if Panfrost Mali GPU or VirtIO-GPU is present via standard DRM VFS */
+    int probe_fd = drm_fd;
+    bool need_close = false;
+    if (probe_fd <= 0) {
+        probe_fd = open("/dev/dri/renderD128", O_RDWR);
+        if (probe_fd < 0) probe_fd = open("/dev/card1", O_RDWR);
+        if (probe_fd < 0) probe_fd = open("/dev/dri/card0", O_RDWR);
+        if (probe_fd < 0) probe_fd = open("/dev/card0", O_RDWR);
+        need_close = true;
+    }
 
-    if (render && render->driver) {
-        screen->driver_name = "panfrost-bifrost";
-        screen->driver_type = GALLIUM_DRIVER_PANFROST;
-    } else if (primary && primary->driver) {
-        screen->driver_name = "virgl";
-        screen->driver_type = GALLIUM_DRIVER_VIRGL;
-    } else {
+    if (probe_fd >= 0) {
+        char name[32] = {0};
+        struct drm_version v;
+        memset(&v, 0, sizeof(v));
+        v.name = name;
+        v.name_len = sizeof(name);
+        if (ioctl(probe_fd, DRM_IOCTL_VERSION, &v) == 0) {
+            if (strstr(name, "panfrost")) {
+                screen->driver_name = "panfrost-bifrost";
+                screen->driver_type = GALLIUM_DRIVER_PANFROST;
+            } else if (strstr(name, "virtio")) {
+                screen->driver_name = "virgl";
+                screen->driver_type = GALLIUM_DRIVER_VIRGL;
+            }
+        }
+        if (need_close) {
+            close(probe_fd);
+        }
+    }
+
+    if (!screen->driver_name) {
         screen->driver_name = "softpipe";
         screen->driver_type = GALLIUM_DRIVER_SOFTPERF;
     }
